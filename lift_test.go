@@ -267,3 +267,119 @@ func TestMovesOutOfDefaultLiftAPartitionedReferencingTablesKey(t *testing.T) {
 		"orders_user_id_fkey FOREIGN KEY (user_id, user_created_at) REFERENCES " + schema + ".users(id, created_at) ON UPDATE CASCADE ON DELETE CASCADE",
 	})
 }
+
+// convertedTasksWithASelfKey converts tasks (an October and a November task,
+// monthly in Jakarta, on 2026-11-17), adds by hand a key the table holds on
+// itself — a task's parent task, ON DELETE CASCADE — and then a December
+// parent task (id 3) and a January subtask of it (id 4), both in
+// tasks_default.
+func convertedTasksWithASelfKey(t *testing.T, db *gorm.DB, m *Manager, schema string) TableName {
+	t.Helper()
+
+	tasks := TableName{Schema: schema, Name: "tasks"}
+	execIn(t, db, schema,
+		"CREATE TABLE $S.tasks (id BIGSERIAL PRIMARY KEY, name TEXT, created_at TIMESTAMPTZ NOT NULL, parent_id BIGINT, parent_created_at TIMESTAMPTZ)",
+		"INSERT INTO $S.tasks (name, created_at) VALUES ('october', '2026-10-05 08:00+07'), ('november', '2026-11-10 08:00+07')",
+	)
+	err := m.PartitionExistTable(context.Background(), tasks, jakartaConfig(t, RangeTypeMonthly))
+	if err != nil {
+		t.Fatalf("PartitionExistTable: %v", err)
+	}
+
+	execIn(t, db, schema,
+		"ALTER TABLE $S.tasks ADD CONSTRAINT tasks_parent_fkey FOREIGN KEY (parent_id, parent_created_at) REFERENCES $S.tasks (id, created_at) ON DELETE CASCADE",
+		"INSERT INTO $S.tasks (name, created_at) VALUES ('december parent', '2026-12-05 08:00+07')",
+		"INSERT INTO $S.tasks (name, created_at, parent_id, parent_created_at) VALUES ('january subtask', '2027-01-06 08:00+07', 3, '2026-12-05 08:00+07')",
+	)
+	for _, id := range []int64{3, 4} {
+		if got := partitionOfRow(t, db, tasks, id); got != "tasks_default" {
+			t.Fatalf("task %d is in %s, want tasks_default", id, got)
+		}
+	}
+	return tasks
+}
+
+// taskRows lists every task as "<id> <name> <parent> <partition>", the parent
+// being the id of the task its key points at (NULL for none).
+func taskRows(t *testing.T, db *gorm.DB, tasks TableName) []string {
+	t.Helper()
+
+	var rows []string
+	err := db.
+		Raw(`SELECT r.id || ' ' || r.name || ' ' || COALESCE(p.id::text, 'NULL') || ' ' || c.relname
+FROM ` + tasks.quoted() + ` AS r
+JOIN pg_catalog.pg_class AS c ON c.oid = r.tableoid
+LEFT JOIN ` + tasks.quoted() + ` AS p ON p.id = r.parent_id AND p.created_at = r.parent_created_at
+ORDER BY r.id`).
+		Scan(&rows).
+		Error
+	if err != nil {
+		t.Fatalf("read the tasks: %v", err)
+	}
+	return rows
+}
+
+// A move out of DEFAULT lifts a key the table holds on itself too: moving the
+// December parent task would otherwise delete (ON DELETE CASCADE) its
+// January subtask. Both tasks move, the subtask still points at its parent,
+// and the key is back unchanged — deleting the parent still deletes the
+// subtask.
+func TestMovesOutOfDefaultLiftTheTablesKeyToItself(t *testing.T) {
+	db := openTestDB(t)
+	jakarta := mustLoadLocation(t, "Asia/Jakarta")
+
+	moves := []struct {
+		name string
+		now  func() time.Time
+		move func(ctx context.Context, m *Manager) error
+	}{
+		{
+			name: "provisioning",
+			now:  clockAt(t, jakarta, 2026, time.November, 17, 9),
+			move: func(ctx context.Context, m *Manager) error {
+				return m.MaintainPartitionTableProvision(ctx, 2)
+			},
+		},
+		{
+			name: "MaintainPartition",
+			now:  clockAt(t, jakarta, 2027, time.January, 5, 9),
+			move: func(ctx context.Context, m *Manager) error {
+				reports, err := m.MaintainPartition(ctx)
+				if err == nil && (len(reports) != 1 || reports[0].Moved != 2 || reports[0].LeftInDefault != 0) {
+					t.Fatalf("MaintainPartition reports %+v, want 2 rows moved and none left", reports)
+				}
+				return err
+			},
+		},
+	}
+	for _, mv := range moves {
+		t.Run(mv.name, func(t *testing.T) {
+			ctx := context.Background()
+			schema := createTestSchema(t, db)
+			m := newTestManager(t, db)
+			m.now = clockAt(t, jakarta, 2026, time.November, 17, 9)
+			tasks := convertedTasksWithASelfKey(t, db, m, schema)
+			beforeKeys := foreignKeysOf(t, db, tasks)
+
+			m.now = mv.now
+			err := mv.move(ctx, m)
+			if err != nil {
+				t.Fatalf("%s: %v", mv.name, err)
+			}
+
+			mustEqualStrings(t, "tasks after the move", taskRows(t, db, tasks), []string{
+				"1 october NULL tasks_202610",
+				"2 november NULL tasks_202611",
+				"3 december parent NULL tasks_202612",
+				"4 january subtask 3 tasks_202701",
+			})
+			mustEqualStrings(t, "foreign keys of tasks after the move", foreignKeysOf(t, db, tasks), beforeKeys)
+			foreignKeyOid(t, db, tasks, "tasks_parent_fkey")
+
+			execIn(t, db, schema, "DELETE FROM $S.tasks WHERE id = 3")
+			if got := countRows(t, db, tasks); got != 2 {
+				t.Fatalf("tasks holds %d rows after deleting the parent task, want 2", got)
+			}
+		})
+	}
+}

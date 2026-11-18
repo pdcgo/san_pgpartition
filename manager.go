@@ -46,6 +46,9 @@ type managerHooks struct {
 	// afterTableLock runs once a maintenance call holds ACCESS EXCLUSIVE on
 	// a table, before it creates the first child.
 	afterTableLock func()
+	// afterChild runs once a maintenance call created a child and moved its
+	// rows in, holding every lock it has taken so far.
+	afterChild func()
 }
 
 // NewManager returns a manager working through db that keeps its own tables

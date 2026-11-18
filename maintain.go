@@ -36,11 +36,13 @@ type MaintainReport struct {
 // stays in DEFAULT and is counted in LeftInDefault on every call — a
 // back-dated import before the oldest child, a typo year past the horizon,
 // NULL and infinite keys — until someone deals with it. Children are created
-// and rows moved exactly as provisioning does (the tables pointing at it
-// locked first, then ACCESS EXCLUSIVE on the parent while it runs, their
-// foreign keys lifted around the move, rows through a temporary table,
-// children named and marked like the conversion's); a second call moves
-// nothing.
+// and rows moved exactly as provisioning does (the other tables pointing at
+// it locked first — ACCESS EXCLUSIVE, since rows move, or SHARE ROW
+// EXCLUSIVE should DEFAULT hold none of them by the time the table is
+// locked — then ACCESS EXCLUSIVE on the parent while it runs, every foreign
+// key pointing at it, its own on itself included, lifted around the move,
+// rows through a temporary table, children named and marked like the
+// conversion's); a second call moves nothing.
 //
 // The reports come one per registered table, zeros included, sorted by
 // schema and then name. Each table is one transaction under the manager's
@@ -99,6 +101,7 @@ func (m *Manager) maintainTable(tx *gorm.DB, entry registryEntry) (MaintainRepor
 		return report, err
 	}
 	mt.afterLock = m.hooks.afterTableLock
+	mt.afterChild = m.hooks.afterChild
 	if mt.deflt == nil {
 		return report, nil
 	}
@@ -108,6 +111,12 @@ func (m *Manager) maintainTable(tx *gorm.DB, entry registryEntry) (MaintainRepor
 		return report, err
 	}
 
+	if len(plan) > 0 {
+		err = mt.lock(tx, plan)
+		if err != nil {
+			return report, lockLimitHint(err, len(plan))
+		}
+	}
 	for _, r := range plan {
 		moved, err := mt.createChild(tx, r)
 		if err != nil {

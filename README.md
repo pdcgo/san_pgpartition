@@ -189,7 +189,7 @@ cannot simply point at the new table: a key into it must reference a unique key,
 | --- | --- |
 | the primary key, which the conversion extends from `(id)` to `(id, created_at)` | **reshaped**: a new column, filled, the key replaced, a fill trigger (below) |
 | a unique key that already holds the partition key — `(id, created_at)`, `(code, created_at)` | the key is re-created on the new table, same name and definition — nothing else changes |
-| the table itself | the conversion is refused (`ErrReferencedByForeignKey`) |
+| the table itself | the conversion is refused (`ErrReferencedByForeignKey`); one added by hand after the conversion is lifted around moves like any other key ([Moves and the keys pointing in](#moves-and-the-keys-pointing-in)) |
 
 **The reshape**, for `orders.user_id NOT NULL → users(id) ON DELETE CASCADE` with `users` converted on `created_at`:
 
@@ -304,8 +304,9 @@ same for every table. On 2026-11-17 in Jakarta, `n = 6` keeps ready:
   (PostgreSQL refuses to create a child while `DEFAULT` holds rows of its range): the parent is locked `ACCESS
   EXCLUSIVE`, the rows are deleted from `DEFAULT` into a temporary table, the child is created, the rows go back in
   through the parent (which routes them to it). Fewer rows back than out fails the call — a move never loses rows.
-  Other tables' foreign keys pointing at the table are lifted around the move:
-  [Moves and the keys pointing in](#moves-and-the-keys-pointing-in).
+  Every foreign key pointing at the table — other tables', and one it holds on itself — is lifted around the move:
+  [Moves and the keys pointing in](#moves-and-the-keys-pointing-in). The tables holding them are locked only as hard
+  as the job needs: [Maintenance locks](#maintenance-locks).
 - **Safe to repeat**: a child that exists (found by its bounds) is left alone; a second call creates nothing and never
   locks the table exclusively. New children get the same names and the `created by san_pgpartition` comment as the conversion's.
 - `n` below 1 is `ErrInvalidConfig`. Without a registry (nothing converted yet) it returns `nil` and creates nothing.
@@ -364,7 +365,7 @@ flowchart TD
   RD --> G["group DEFAULT rows by period or block"]
   G --> W{"between the oldest child and the horizon?"}
   W -->|no| ST["stays in DEFAULT, counted in LeftInDefault"]
-  W -->|yes| AX["LOCK the tables pointing at it, then the parent, ACCESS EXCLUSIVE, once"]
+  W -->|yes| AX["LOCK the other tables pointing at it, then the parent, ACCESS EXCLUSIVE, once"]
   AX --> DK["drop the keys pointing at it, once"]
   DK --> MV["DELETE the period's rows from DEFAULT into a temporary table"]
   MV --> CC["CREATE the child, marked created by san_pgpartition"]
@@ -376,8 +377,9 @@ flowchart TD
 
 ## Moves and the keys pointing in
 
-A move out of `DEFAULT` is a `DELETE` and an `INSERT` back, and a foreign key another table holds on the table sees
-the `DELETE`. With a user sitting in `DEFAULT` and orders pointing at it, the move would:
+A move out of `DEFAULT` is a `DELETE` and an `INSERT` back, and every foreign key pointing at the table sees the
+`DELETE` — another table's, or one the table holds on itself. With a user sitting in `DEFAULT` and orders pointing at
+it, the move would:
 
 | The orders' foreign key | Without lifting the key |
 | --- | --- |
@@ -386,11 +388,19 @@ the `DELETE`. With a user sitting in `DEFAULT` and orders pointing at it, the mo
 | `NO ACTION` (the default) | fails the move: *still referenced from table "orders"* |
 
 So whenever provisioning or `MaintainPartition` actually moves rows, in the table's transaction it **drops every
-foreign key another table holds that points at the table** (the parent-level key; its copies for each child go with
-it), keeping each one's name and `pg_get_constraintdef`, moves the rows, and after the table's last child **adds each
-key back unchanged** — same name, columns, `ON UPDATE` / `ON DELETE`, `DEFERRABLE`, even `NOT VALID`. Every order
-keeps its user (tested for `CASCADE`, `SET NULL` and `NO ACTION`, through both calls; with the lift removed the
-`CASCADE` test loses orders).
+foreign key that points at the table** — other tables' and the table's own on itself (the parent-level key; its copies
+for each child go with it) — keeping each one's name and `pg_get_constraintdef`, moves the rows, and after the table's
+last child **adds each key back unchanged** — same name, columns, `ON UPDATE` / `ON DELETE`, `DEFERRABLE`, even
+`NOT VALID`. Every order keeps its user (tested for `CASCADE`, `SET NULL` and `NO ACTION`, through both calls; with
+the lift removed the `CASCADE` test loses orders).
+
+**A key the table holds on itself** — the conversion still refuses one, so it is added by hand afterwards, e.g.
+`tasks (parent_id, parent_created_at) → tasks (id, created_at) ON DELETE CASCADE` — is lifted the same way. Without it,
+moving a December parent task out of `DEFAULT` deletes its January subtask still waiting there (probed; a subtask
+moved in the same statement as its parent would survive, one in another period or left in `DEFAULT` does not).
+Tested through both calls: the parent and the subtask both move, the subtask still points at its parent, the key is
+back with the same name and definition and still cascades; with the self-key left out of the lift the subtask is lost.
+Adding it back re-checks the table against itself — only when `DEFAULT` held rows to move.
 
 - Adding a key back checks every row of its table again, which stays locked meanwhile — only when `DEFAULT` held rows
   of a period (a missed cron or a back-dated row).
@@ -417,13 +427,50 @@ flowchart LR
   EXCLUSIVE` on the parent** (`LOCK TABLE ONLY` — the children are not locked one by one), held to the commit: the
   app's reads and writes of the table wait meanwhile, then run on the new child. Measured: 200,000 rows moved out of `DEFAULT` into
   a new month in 4.0 s; 365 empty daily children created in 2.6 s.
-- **The tables pointing at it are locked first.** Before the parent, every table holding a foreign key that points at
-  it is locked `ACCESS EXCLUSIVE`, one at a time in OID order (the conversion's order). Creating a child locks them
-  anyway — PostgreSQL adds the key's copy for the new child — and a move drops and re-adds their keys. Taken after the
-  parent's lock, an app transaction that wrote `orders` and then writes an order for a user (its fill trigger and key
-  check read `users`) would deadlock with the cron; this way the cron waits for it (tested; with the order reversed
-  PostgreSQL reports a deadlock). A `ROW EXCLUSIVE` lock on the parent, taken before the keys are read, keeps a new key
-  from appearing meanwhile.
+- **The tables pointing at it are locked first.** Before the parent, every other table holding a foreign key that
+  points at it is locked, one at a time in OID order (the conversion's order). Taken after the parent's lock, an app
+  transaction that wrote `orders` and then writes an order for a user (its fill trigger and key check read `users`)
+  would deadlock with the cron; this way the cron waits for it (tested; with the order reversed PostgreSQL reports a
+  deadlock). A `ROW EXCLUSIVE` lock on the parent, taken before the keys are read and kept, keeps a new key from
+  appearing meanwhile. A table holding a key on itself is the parent: it is locked last, as the parent, not again
+  among the referencing tables (tested: locked among them by OID it deadlocks an app that read a referencing table
+  created after the conversion and then reads the parent).
+- **Only as hard as the job needs** — the strength per job:
+
+  | Job | Each other table holding a key to it | The parent |
+  | --- | --- | --- |
+  | provisioning / `MaintainPartition` creating children, `DEFAULT` holding no rows of them | `SHARE ROW EXCLUSIVE` — the app's reads go on, its writes wait | `ACCESS EXCLUSIVE` |
+  | a move out of `DEFAULT` (keys dropped and added back) | `ACCESS EXCLUSIVE` | `ACCESS EXCLUSIVE` |
+  | the conversion (columns, keys, triggers added) | `ACCESS EXCLUSIVE` | `ACCESS EXCLUSIVE` from the first rename |
+  | nothing to create | none | none |
+
+  `SHARE ROW EXCLUSIVE` is what PostgreSQL itself takes on `orders` to create a child of `users` (it adds the key's
+  copy for the child). Tested: while provisioning holds its locks after creating a child, the app reads `orders` in
+  ~10 ms and its insert into `orders` waits for the commit; with a move the read waits. With `ACCESS EXCLUSIVE` there
+  the read times out.
+- **Decided once, before the first child, never upgraded in place.** Whether rows move is known only under the
+  parent's lock (until then the app can insert into `DEFAULT`), so the weak locks are taken under a savepoint, then the
+  parent's, then one `EXISTS` looks in `DEFAULT` for a row of any child the call creates. Rows to move: back to the
+  savepoint — which gives back those locks and the parent's, keeping the `ROW EXCLUSIVE` — and the `ACCESS EXCLUSIVE`
+  ones taken in the same order. Upgrading `orders` while holding `users` would deadlock with an app that read `orders`
+  and then reads `users` (tested: two children, the first with nothing to move, the second moving a user; upgraded in
+  place PostgreSQL reports a deadlock, decided first the cron waits on `orders` and the app's read of `users` goes
+  through).
+
+```mermaid
+flowchart TD
+  RE["LOCK parent ONLY ROW EXCLUSIVE, read the keys pointing at it"] --> SP["SAVEPOINT"]
+  SP --> WK["LOCK each other referencing table SHARE ROW EXCLUSIVE, by OID"]
+  WK --> PA["LOCK parent ONLY ACCESS EXCLUSIVE"]
+  PA --> Q{"DEFAULT holds a row of a child it creates?"}
+  Q -- no --> GO["release the savepoint, create the children"]
+  Q -- yes --> RB["ROLLBACK TO SAVEPOINT, those locks given back"]
+  RB --> ST["LOCK each other referencing table ACCESS EXCLUSIVE, by OID"]
+  ST --> PB["LOCK parent ONLY ACCESS EXCLUSIVE"]
+  PB --> MV["lift the keys, move the rows, create the children, add the keys back"]
+```
+
+Either way the parent itself is closed to the app from its lock to the commit:
 
 ```mermaid
 sequenceDiagram
@@ -709,8 +756,8 @@ removed.
   tables, how long to keep, what happens to `_old`). `PartitionDropTable` only undoes empty children the package
   created.
 - **A table's foreign key to itself** (`categories.parent_id`) — it stops the conversion (`ErrReferencedByForeignKey`).
-  The other refusals under *What stops a conversion* likewise. A move lifts only other tables' keys: a key a
-  converted table holds to itself (added by hand after the conversion) is not lifted.
+  The other refusals under *What stops a conversion* likewise. (Added by hand after the conversion, such a key is
+  lifted around moves like any other.)
 - **Attaching an existing, filled table** (`ATTACH PARTITION`) — a separate API later: it validates every row and locks
   differently.
 - **Non-blocking index building** — `ON ONLY` parent, `CONCURRENTLY` per partition, then `ATTACH` — including finishing

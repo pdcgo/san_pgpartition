@@ -13,8 +13,11 @@
 // into the new child), and [Manager.MaintainPartition] moves the rows that
 // still land in a table's DEFAULT partition into their children and reports,
 // per table, what it moved and what it left ([MaintainReport]). A move lifts
-// the foreign keys pointing at the table around it, so no ON DELETE action
-// fires.
+// every foreign key pointing at the table around it — the table's own on
+// itself included — so no ON DELETE action fires. Maintenance locks the
+// tables holding those keys only as hard as the job needs: SHARE ROW
+// EXCLUSIVE when it only creates children (the app keeps reading them),
+// ACCESS EXCLUSIVE when it moves rows.
 //
 // Under it, plain functions work on any partitioned table: whether a child
 // partition is attached to a parent ([PartitionAttached]), creating a fresh

@@ -34,16 +34,23 @@ import (
 // from that lock to the commit, then run on the new child. Nothing is locked
 // when nothing is missing.
 //
-// Foreign keys other tables hold that point at the table are lifted around a
-// move: dropped before the first row leaves DEFAULT and added back, same
-// names and definitions, once the table's children are done — a DELETE from
-// DEFAULT would otherwise fire them (ON DELETE CASCADE deleting the rows
-// pointing at a moved row, SET NULL unlinking them, NO ACTION failing the
-// move). Adding a key back checks every row of its table again. A call
-// that moves nothing touches no key. Whenever it creates a child, those
-// tables are locked ACCESS EXCLUSIVE first, in OID order and before the
-// parent (creating a child locks them anyway), so an app transaction
-// writing one of them is waited for rather than deadlocked with.
+// Every foreign key pointing at the table — other tables' and a key the
+// table holds on itself (added by hand after the conversion) — is lifted
+// around a move: dropped before the first row leaves DEFAULT and added
+// back, same names and definitions, once the table's children are done — a
+// DELETE from DEFAULT would otherwise fire them (ON DELETE CASCADE deleting
+// the rows pointing at a moved row, SET NULL unlinking them, NO ACTION
+// failing the move). Adding a key back checks every row of its table again.
+// A call that moves nothing touches no key.
+//
+// Whenever it creates a child, the other tables holding those keys are
+// locked first, one at a time in OID order and before the parent, so an app
+// transaction writing one of them is waited for rather than deadlocked with
+// — as hard as the job needs: SHARE ROW EXCLUSIVE when nothing moves (what
+// PostgreSQL takes anyway to create the child; the app's reads of them go
+// on, its writes wait), ACCESS EXCLUSIVE when DEFAULT holds rows of a
+// child being created. That is decided once, under the parent's lock,
+// before the first child; it is never upgraded while the parent is held.
 //
 // Each table is one transaction, serialised with the conversion and
 // MaintainPartition through the manager's advisory lock on the table: a
@@ -101,6 +108,7 @@ func (m *Manager) provisionTable(tx *gorm.DB, entry registryEntry, n int) error 
 		return err
 	}
 	mt.afterLock = m.hooks.afterTableLock
+	mt.afterChild = m.hooks.afterChild
 
 	plan, err := mt.provisionPlan(tx, m.now(), n)
 	if err != nil {
@@ -114,6 +122,12 @@ func (m *Manager) provisionTable(tx *gorm.DB, entry registryEntry, n int) error 
 		}
 	}
 
+	if len(missing) > 0 {
+		err = mt.lock(tx, missing)
+		if err != nil {
+			return lockLimitHint(err, len(missing))
+		}
+	}
 	for _, r := range missing {
 		_, err = mt.createChild(tx, r)
 		if err != nil {

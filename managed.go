@@ -98,13 +98,15 @@ type managedTable struct {
 
 	columns []string // the parent's stored columns, quoted, read on the first move
 	locked  bool     // ACCESS EXCLUSIVE on the parent is held
-	// pointingIn are the foreign keys other tables hold that point at the
-	// table, read by lock; keysLifted says the first move dropped them and
-	// restoreKeys has to add them back.
+	// pointingIn are the foreign keys that point at the table — other
+	// tables' and its own on itself — read by lock; keysLifted says the first
+	// move dropped them and restoreKeys has to add them back.
 	pointingIn []liftedKey
 	keysLifted bool
-	// afterLock runs once the parent is locked; tests set it.
-	afterLock func()
+	// afterLock runs once the parent is locked, afterChild once a child is
+	// created and its rows moved in; tests set them.
+	afterLock  func()
+	afterChild func()
 }
 
 // loadTable reads what a maintenance call needs to know about a registered
@@ -276,19 +278,34 @@ func (mt *managedTable) has(r childRange) bool {
 	return mt.present[r.from+"|"+r.to]
 }
 
-// lock takes ACCESS EXCLUSIVE on the parent, once: the app's reads and
+// lockSavepoint marks where lock takes its first, weaker locks, so it can
+// give them back when the plan turns out to move rows.
+const lockSavepoint = "san_pgpartition_lock"
+
+// lock takes, once, the locks a maintenance call needs to create the
+// children of plan. The parent gets ACCESS EXCLUSIVE: the app's reads and
 // writes of the table wait from here to the commit, so no row reaches
 // DEFAULT while rows move out of it. ONLY: the children need no lock of
 // their own (a lock on each would fill the lock table on a big table).
 //
 // Every table holding a foreign key that points at the parent is locked
-// ACCESS EXCLUSIVE first, one at a time in OID order: creating a child
-// locks them anyway (PostgreSQL adds the key's copy for the child), and a
-// move drops and re-adds their keys. Taken after the parent's lock, an app
+// first, one at a time in OID order: taken after the parent's lock, an app
 // transaction that wrote such a table and then checks a key against the
-// parent would deadlock with the call. ROW EXCLUSIVE on the parent before
-// reading the keys keeps a new one from appearing meanwhile.
-func (mt *managedTable) lock(tx *gorm.DB) error {
+// parent would deadlock with the call. How hard depends on the plan:
+// SHARE ROW EXCLUSIVE when no planned child has rows in DEFAULT — what
+// PostgreSQL itself takes to add the key's copy for a new child, so the
+// app's reads of those tables go on and only its writes wait — and ACCESS
+// EXCLUSIVE when one has, since a move drops and re-adds their keys.
+//
+// Whether rows move is known only once the parent is locked (until then the
+// app can insert into DEFAULT), so the weaker locks are taken under a
+// savepoint; when the plan moves rows, the savepoint is rolled back — which
+// gives back those locks and the parent's — and the stronger ones are taken
+// in the same order. Upgrading a referencing table's lock while holding the
+// parent would deadlock with an app that read that table and then reads
+// the parent. ROW EXCLUSIVE on the parent, taken before reading the keys
+// and kept throughout, keeps a new key from appearing meanwhile.
+func (mt *managedTable) lock(tx *gorm.DB, plan []childRange) error {
 	var err error
 
 	if mt.locked {
@@ -305,16 +322,9 @@ func (mt *managedTable) lock(tx *gorm.DB) error {
 	if err != nil {
 		return err
 	}
-	err = mt.lockReferencing(tx)
+	err = mt.lockForPlan(tx, plan)
 	if err != nil {
 		return err
-	}
-
-	err = tx.
-		Exec("LOCK TABLE ONLY " + mt.table.quoted() + " IN ACCESS EXCLUSIVE MODE").
-		Error
-	if err != nil {
-		return fmt.Errorf("san_pgpartition: lock %s: %w", mt.table, err)
 	}
 	mt.locked = true
 
@@ -324,6 +334,105 @@ func (mt *managedTable) lock(tx *gorm.DB) error {
 	return nil
 }
 
+// lockForPlan locks the referencing tables as hard as plan needs, then the
+// parent; see lock.
+func (mt *managedTable) lockForPlan(tx *gorm.DB, plan []childRange) error {
+	var err error
+
+	if len(mt.referencing()) == 0 {
+		return mt.lockParent(tx)
+	}
+
+	err = tx.
+		Exec("SAVEPOINT " + lockSavepoint).
+		Error
+	if err != nil {
+		return fmt.Errorf("san_pgpartition: lock %s: %w", mt.table, err)
+	}
+	err = mt.lockReferencing(tx, shareRowExclusive)
+	if err != nil {
+		return err
+	}
+	err = mt.lockParent(tx)
+	if err != nil {
+		return err
+	}
+
+	moves, err := mt.defaultHoldsRowsFor(tx, plan)
+	if err != nil {
+		return err
+	}
+	if !moves {
+		err = tx.
+			Exec("RELEASE SAVEPOINT " + lockSavepoint).
+			Error
+		if err != nil {
+			return fmt.Errorf("san_pgpartition: lock %s: %w", mt.table, err)
+		}
+		return nil
+	}
+
+	err = tx.
+		Exec("ROLLBACK TO SAVEPOINT " + lockSavepoint).
+		Error
+	if err != nil {
+		return fmt.Errorf("san_pgpartition: lock %s: %w", mt.table, err)
+	}
+	err = tx.
+		Exec("RELEASE SAVEPOINT " + lockSavepoint).
+		Error
+	if err != nil {
+		return fmt.Errorf("san_pgpartition: lock %s: %w", mt.table, err)
+	}
+	err = mt.lockReferencing(tx, accessExclusive)
+	if err != nil {
+		return err
+	}
+	return mt.lockParent(tx)
+}
+
+// lockParent takes ACCESS EXCLUSIVE on the parent alone.
+func (mt *managedTable) lockParent(tx *gorm.DB) error {
+	var err error
+
+	err = tx.
+		Exec("LOCK TABLE ONLY " + mt.table.quoted() + " IN ACCESS EXCLUSIVE MODE").
+		Error
+	if err != nil {
+		return fmt.Errorf("san_pgpartition: lock %s: %w", mt.table, err)
+	}
+	return nil
+}
+
+// defaultHoldsRowsFor reports whether DEFAULT holds a row of any child in
+// plan, that is whether creating them moves rows.
+func (mt *managedTable) defaultHoldsRowsFor(tx *gorm.DB, plan []childRange) (bool, error) {
+	var err error
+
+	if mt.deflt == nil || len(plan) == 0 {
+		return false, nil
+	}
+
+	key := quoteIdentifier(mt.pconf.Key)
+	bound := "CAST(CAST(? AS text) AS " + mt.keyType + ")"
+	ranges := make([]string, 0, len(plan))
+	args := make([]any, 0, 2*len(plan))
+	for _, r := range plan {
+		ranges = append(ranges, "("+key+" >= "+bound+" AND "+key+" < "+bound+")")
+		args = append(args, r.from, r.to)
+	}
+
+	var found bool
+	err = tx.
+		Raw("SELECT EXISTS (SELECT 1 FROM "+mt.deflt.quoted()+" WHERE "+strings.Join(ranges, " OR ")+")", args...).
+		Row().
+		Scan(&found)
+	if err != nil {
+		return false, fmt.Errorf("san_pgpartition: look for rows to move in %s: %w", mt.deflt, err)
+	}
+	return found, nil
+}
+
 // movingTable is the temporary table rows wait in while their child is
 // created; dropped again before the next child.
 const movingTable = "san_pgpartition_moving"
@@ -331,17 +440,13 @@ const movingTable = "san_pgpartition_moving"
 // createChild creates the child r under the table, moving the rows of its
 // range out of DEFAULT first and back in through the parent after —
 // PostgreSQL refuses to create a child while DEFAULT holds rows of its range.
-// It returns how many rows it moved. The parent is locked first.
+// It returns how many rows it moved. The caller has locked the table for a
+// plan holding r (lock).
 func (mt *managedTable) createChild(tx *gorm.DB, r childRange) (int64, error) {
 	var err error
 
 	child := TableName{Schema: mt.table.Schema, Name: mt.table.Name + r.suffix}
 	err = validateIdentifier("child table name", child.Name)
-	if err != nil {
-		return 0, err
-	}
-
-	err = mt.lock(tx)
 	if err != nil {
 		return 0, err
 	}
@@ -369,6 +474,10 @@ func (mt *managedTable) createChild(tx *gorm.DB, r childRange) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
+	}
+
+	if mt.afterChild != nil {
+		mt.afterChild()
 	}
 	return moved, nil
 }
