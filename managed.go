@@ -98,6 +98,11 @@ type managedTable struct {
 
 	columns []string // the parent's stored columns, quoted, read on the first move
 	locked  bool     // ACCESS EXCLUSIVE on the parent is held
+	// pointingIn are the foreign keys other tables hold that point at the
+	// table, read by lock; keysLifted says the first move dropped them and
+	// restoreKeys has to add them back.
+	pointingIn []liftedKey
+	keysLifted bool
 	// afterLock runs once the parent is locked; tests set it.
 	afterLock func()
 }
@@ -275,12 +280,36 @@ func (mt *managedTable) has(r childRange) bool {
 // writes of the table wait from here to the commit, so no row reaches
 // DEFAULT while rows move out of it. ONLY: the children need no lock of
 // their own (a lock on each would fill the lock table on a big table).
+//
+// Every table holding a foreign key that points at the parent is locked
+// ACCESS EXCLUSIVE first, one at a time in OID order: creating a child
+// locks them anyway (PostgreSQL adds the key's copy for the child), and a
+// move drops and re-adds their keys. Taken after the parent's lock, an app
+// transaction that wrote such a table and then checks a key against the
+// parent would deadlock with the call. ROW EXCLUSIVE on the parent before
+// reading the keys keeps a new one from appearing meanwhile.
 func (mt *managedTable) lock(tx *gorm.DB) error {
 	var err error
 
 	if mt.locked {
 		return nil
 	}
+	err = tx.
+		Exec("LOCK TABLE ONLY " + mt.table.quoted() + " IN ROW EXCLUSIVE MODE").
+		Error
+	if err != nil {
+		return fmt.Errorf("san_pgpartition: lock %s: %w", mt.table, err)
+	}
+
+	err = mt.readKeysPointingIn(tx)
+	if err != nil {
+		return err
+	}
+	err = mt.lockReferencing(tx)
+	if err != nil {
+		return err
+	}
+
 	err = tx.
 		Exec("LOCK TABLE ONLY " + mt.table.quoted() + " IN ACCESS EXCLUSIVE MODE").
 		Error
@@ -367,6 +396,11 @@ func (mt *managedTable) moveOut(tx *gorm.DB, r childRange) (int64, error) {
 	}
 
 	columns, err := mt.storedColumns(tx)
+	if err != nil {
+		return 0, err
+	}
+
+	err = mt.liftKeys(tx)
 	if err != nil {
 		return 0, err
 	}

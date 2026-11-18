@@ -19,7 +19,7 @@ cron, a CLI — decides when to run it. Every call runs in a transaction (a save
 | Function | Does |
 | --- | --- |
 | `NewManager(db, schemaconf) *Manager` | A manager keeping its registry (`partitioned_tables`) in the schema `schemaconf`. Touches nothing in the database. |
-| `manager.PartitionExistTable(ctx, table, pconf) error` | **Converts** an existing plain table into one partitioned by RANGE on a date or number column — same name, rows, indexes and foreign keys — in one transaction, and records it with its config. |
+| `manager.PartitionExistTable(ctx, table, pconf) error` | **Converts** an existing plain table into one partitioned by RANGE on a date or number column — same name, rows, indexes and foreign keys — in one transaction, and records it with its config. Other tables' foreign keys pointing at it are reshaped onto its new key (a column, filled, the key re-created, a fill trigger). |
 | `manager.MaintainPartitionTableProvision(ctx, n) error` | For every recorded table: creates the children `n` of its own periods ahead (6 months, 6 days, 6 years, 6 blocks), filling a missed cron's gap, moving `DEFAULT` rows of a period it creates into the new child. |
 | `manager.MaintainPartition(ctx) ([]MaintainReport, error)` | For every recorded table: moves the `DEFAULT` rows lying between the oldest child and the horizon into their children; reports per table the rows moved and the rows left in `DEFAULT`. |
 | `PartitionAttached(ctx, db, parent, child) (bool, error)` | Is `child` a partition attached directly to `parent`? Reads the catalog only, no locks. |
@@ -123,7 +123,10 @@ flowchart TD
   P -->|no| K[LOCK table ROW EXCLUSIVE, check the key column]
   K --> X{"anything to refuse?"}
   X -->|yes| E["one error naming every offender"]
-  X -->|no| N[CREATE TABLE t_new LIKE t PARTITION BY RANGE key]
+  X -->|no| LR["LOCK each table pointing at it ACCESS EXCLUSIVE, in OID order"]
+  LR --> NM{"a name the reshape adds taken or too long?"}
+  NM -->|yes| E
+  NM -->|no| N[CREATE TABLE t_new LIKE t PARTITION BY RANGE key]
   N --> I["rename each index to name_old, create it on t_new under its name"]
   I --> F[drop the table's own foreign keys]
   F --> S["rename t to t_old, t_new to t"]
@@ -131,7 +134,8 @@ flowchart TD
   FA --> C["one child per period of t_old's rows, plus t_default"]
   C --> SD[copy the rows from t_old]
   SD --> Q[hand t_old's sequences to t]
-  Q --> AN[ANALYZE t]
+  Q --> RS["move each key pointing at it to t: re-point, or reshape its table"]
+  RS --> AN[ANALYZE t]
   AN --> W[write the registry row]
 ```
 
@@ -156,6 +160,8 @@ flowchart TD
 - **`<table>_old` is kept** with every original row. The id sequence is handed to the new table (`OWNED BY`), so your
   later migration can `DROP TABLE <table>_old`; until then the data takes its disk space twice.
 - `ANALYZE` runs on the new table: autovacuum never analyzes a partitioned parent.
+- **Other tables' foreign keys pointing at it move to the new table** — most of them by reshaping the other table:
+  see [Foreign keys pointing at the table](#foreign-keys-pointing-at-the-table).
 
 ### What stops a conversion
 
@@ -164,11 +170,110 @@ come back joined: `errors.Is` matches each.
 
 | Error | The table has… | Why |
 | --- | --- | --- |
-| `ErrReferencedByForeignKey` | another table's foreign key pointing at it (named `schema.table.constraint`), or its own pointing at itself | after the swap it would still reference `<table>_old`; the partitioned table cannot take it on `(id)` alone |
+| `ErrReferencedByForeignKey` | its own foreign key pointing at itself (a tree: `categories.parent_id → categories(id)`, named `schema.table.constraint`) | the reshape would add a column and a trigger to the very table being converted. Other tables' keys do not stop it — they are reshaped |
 | `ErrUniqueKeyWithoutPartitionKey` | a unique key or unique index, other than the primary key, without the partition key | PostgreSQL can only keep a key unique across partitions when it holds the partition key |
 | `ErrPrimaryKeyNotExtendable` | a primary key without the partition key that is not one sequence-fed column (`event_id`, a composite key) | extending a key the application fills (a dedupe key) breaks `ON CONFLICT` and schema checks |
 | `ErrUnsupportedTableFeature` | a trigger, a view / materialized view / rule on it, row level security or a policy, a publication, an identity column, inheritance (either way, a partition of another table too), an exclusion constraint, granted privileges, extended statistics, an unlogged table, an owner other than the current user | each would stay on `<table>_old` or be lost without a word |
+| `ErrReferenceColumnTaken` | a table pointing at it that already has the column the reshape would add (`orders.user_created_at`) or needs it for two keys (`user_id` and `user`), or already a trigger `<constraint>_fill` on it or a function `<constraint>_fill()` in its schema (or two keys of one schema needing the same) | the reshape never overwrites or reuses anything |
+| `ErrInvalidTableName` | the column or the `<constraint>_fill` name the reshape would add over 63 bytes | PostgreSQL would silently truncate it |
 
+The last two are checked once every table pointing at it is locked — still before anything is created.
+
+### Foreign keys pointing at the table
+
+After the swap a key held by another table (`orders.user_id → users(id)`) would still point at `users_old`, and it
+cannot simply point at the new table: a key into it must reference a unique key, and its primary key is now
+`(id, created_at)`. So the conversion moves every such key to the new table, in the same transaction:
+
+| The key points at… | What happens to the other table |
+| --- | --- |
+| the primary key, which the conversion extends from `(id)` to `(id, created_at)` | **reshaped**: a new column, filled, the key replaced, a fill trigger (below) |
+| a unique key that already holds the partition key — `(id, created_at)`, `(code, created_at)` | the key is re-created on the new table, same name and definition — nothing else changes |
+| the table itself | the conversion is refused (`ErrReferencedByForeignKey`) |
+
+**The reshape**, for `orders.user_id NOT NULL → users(id) ON DELETE CASCADE` with `users` converted on `created_at`:
+
+1. **A new column** named after the key's column — without a trailing `_id`, then `_` and the partition key — of the
+   partition key's type, in the referencing table:
+
+   | Foreign-key column | New column |
+   | --- | --- |
+   | `orders.user_id` | `orders.user_created_at` |
+   | `stock_moves.take_transaction_id` | `stock_moves.take_transaction_created_at` |
+   | `documents.owner` | `documents.owner_created_at` |
+
+2. **Filled** from `users` by the id, then `NOT NULL` exactly when `user_id` is. A row whose id `users` lacks
+   (possible only under a `NOT VALID` key) fails the conversion, naming the key and an id: the new key would never
+   check it — under `MATCH SIMPLE` a pair holding a NULL is not checked.
+3. **The key replaced** under the same name:
+
+   ```sql
+   ALTER TABLE orders ADD CONSTRAINT orders_user_id_fkey
+     FOREIGN KEY (user_id, user_created_at) REFERENCES users (id, created_at)
+     ON UPDATE CASCADE ON DELETE CASCADE
+   ```
+
+   `ON UPDATE` is always `CASCADE`: when a user's `created_at` changes — PostgreSQL moves the user to another child —
+   its orders' `user_created_at` follows (an `id` change would cascade too; ids come from a sequence). `ON DELETE`
+   (`NO ACTION`, `RESTRICT`, `CASCADE`, `SET NULL`, `SET DEFAULT`, a column list too) and `DEFERRABLE` / `INITIALLY
+   DEFERRED` are copied from the old key; the match type is PostgreSQL's default, `MATCH SIMPLE`.
+4. **A fill trigger**, so the app keeps writing only `user_id`. It is created in the referencing table's schema,
+   named after the constraint:
+
+   ```sql
+   CREATE FUNCTION public.orders_user_id_fkey_fill() RETURNS trigger LANGUAGE plpgsql
+     SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fill$
+   BEGIN
+       IF NEW."user_id" IS NULL THEN
+           NEW."user_created_at" := NULL;
+           RETURN NEW;
+       END IF;
+       SELECT k."created_at" INTO NEW."user_created_at"
+       FROM "public"."users" AS k
+       WHERE k."id" = NEW."user_id";
+       IF NOT FOUND THEN
+           RAISE EXCEPTION 'insert or update on table "orders" violates foreign key constraint "orders_user_id_fkey"'
+               USING ERRCODE = 'foreign_key_violation',
+                     DETAIL = pg_catalog.format('Key (user_id)=(%s) is not present in table "users".', NEW."user_id"),
+                     CONSTRAINT = 'orders_user_id_fkey',
+                     TABLE = 'orders',
+                     SCHEMA = 'public';
+       END IF;
+       RETURN NEW;
+   END
+   $fill$;
+   COMMENT ON FUNCTION public.orders_user_id_fkey_fill() IS 'created by san_pgpartition';
+   CREATE TRIGGER orders_user_id_fkey_fill BEFORE INSERT OR UPDATE OF user_id ON public.orders
+     FOR EACH ROW EXECUTE FUNCTION public.orders_user_id_fkey_fill();
+   ```
+
+What the app sees afterwards, still writing only `user_id` (each tested):
+
+| The app… | Result |
+| --- | --- |
+| inserts an order for an existing user | `user_created_at` filled with that user's `created_at`, the key checked |
+| inserts an order for a user that does not exist | refused like before: SQLSTATE 23503, *insert or update on table "orders" violates foreign key constraint "orders_user_id_fkey"*, the same detail, constraint, table and schema fields PostgreSQL's own check gives |
+| inserts an order without a user (`NULL`) | allowed, both columns `NULL` |
+| sends a wrong `user_created_at` | overwritten with the real one |
+| moves an order to another user (`UPDATE … SET user_id`) | refilled |
+| changes a user's `created_at` to another month | the user moves child, its orders' `user_created_at` follows |
+| deletes a user | the old key's `ON DELETE` (a refusal names PostgreSQL's copy of the key for that child, `orders_user_id_user_created_at_fkey…`, not `orders_user_id_fkey`) |
+| runs as a role that may write `orders` but not read `users` | still works: like PostgreSQL's own key check, the lookup runs as the function's owner (`SECURITY DEFINER`, with a fixed `search_path`) |
+
+What it costs:
+
+- **The referencing tables are rewritten and closed**: every row of each is updated (the table takes about twice its
+  space until `VACUUM`), and each is locked `ACCESS EXCLUSIVE` from before the first rename to the commit.
+  Measured: `users` 20,000 rows into 40 monthly children with `orders` 200,000 rows reshaped, 3.3 s.
+- **Every write of `user_id` looks the user up by id alone**, across every child of `users`: 20,000 inserts took
+  6.7 s with the trigger against 1.2 s without on 40 monthly children (≈ 0.3 ms a row); a by-id lookup on ~1,200 daily
+  children ≈ 11 ms. Through a Go client, one round trip per insert: 61 s against 42 s for 20,000. Another reason to
+  prefer `month`.
+- **A referencing table can no longer be converted itself**: it carries a trigger (`ErrUnsupportedTableFeature`).
+- A partitioned referencing table is reshaped once, at its parent; its children follow. Several keys, several
+  tables, other schemas: each is reshaped the same way (`stock_moves.take_transaction_id` and `put_transaction_id`
+  get one column and one trigger each).
+- `id` stays unique only through its sequence; were the same id in two children, the trigger would take one of them.
 ## Keeping children ready: `manager.MaintainPartitionTableProvision`
 
 ```go
@@ -199,6 +304,8 @@ same for every table. On 2026-11-17 in Jakarta, `n = 6` keeps ready:
   (PostgreSQL refuses to create a child while `DEFAULT` holds rows of its range): the parent is locked `ACCESS
   EXCLUSIVE`, the rows are deleted from `DEFAULT` into a temporary table, the child is created, the rows go back in
   through the parent (which routes them to it). Fewer rows back than out fails the call — a move never loses rows.
+  Other tables' foreign keys pointing at the table are lifted around the move:
+  [Moves and the keys pointing in](#moves-and-the-keys-pointing-in).
 - **Safe to repeat**: a child that exists (found by its bounds) is left alone; a second call creates nothing and never
   locks the table exclusively. New children get the same names and the `created by san_pgpartition` comment as the conversion's.
 - `n` below 1 is `ErrInvalidConfig`. Without a registry (nothing converted yet) it returns `nil` and creates nothing.
@@ -257,12 +364,43 @@ flowchart TD
   RD --> G["group DEFAULT rows by period or block"]
   G --> W{"between the oldest child and the horizon?"}
   W -->|no| ST["stays in DEFAULT, counted in LeftInDefault"]
-  W -->|yes| AX["LOCK parent ACCESS EXCLUSIVE, once"]
-  AX --> MV["DELETE the period's rows from DEFAULT into a temporary table"]
+  W -->|yes| AX["LOCK the tables pointing at it, then the parent, ACCESS EXCLUSIVE, once"]
+  AX --> DK["drop the keys pointing at it, once"]
+  DK --> MV["DELETE the period's rows from DEFAULT into a temporary table"]
   MV --> CC["CREATE the child, marked created by san_pgpartition"]
   CC --> IB["INSERT the rows back through the parent, same count or fail"]
-  IB --> RP["report: Moved, LeftInDefault"]
+  IB --> AK["after the last child: add the keys back, same names and definitions"]
+  AK --> RP["report: Moved, LeftInDefault"]
   ST --> RP
+```
+
+## Moves and the keys pointing in
+
+A move out of `DEFAULT` is a `DELETE` and an `INSERT` back, and a foreign key another table holds on the table sees
+the `DELETE`. With a user sitting in `DEFAULT` and orders pointing at it, the move would:
+
+| The orders' foreign key | Without lifting the key |
+| --- | --- |
+| `ON DELETE CASCADE` | deletes the user's orders (2 orders → 1 in the probe) |
+| `ON DELETE SET NULL` | unlinks them |
+| `NO ACTION` (the default) | fails the move: *still referenced from table "orders"* |
+
+So whenever provisioning or `MaintainPartition` actually moves rows, in the table's transaction it **drops every
+foreign key another table holds that points at the table** (the parent-level key; its copies for each child go with
+it), keeping each one's name and `pg_get_constraintdef`, moves the rows, and after the table's last child **adds each
+key back unchanged** — same name, columns, `ON UPDATE` / `ON DELETE`, `DEFERRABLE`, even `NOT VALID`. Every order
+keeps its user (tested for `CASCADE`, `SET NULL` and `NO ACTION`, through both calls; with the lift removed the
+`CASCADE` test loses orders).
+
+- Adding a key back checks every row of its table again, which stays locked meanwhile — only when `DEFAULT` held rows
+  of a period (a missed cron or a back-dated row).
+- A call that moves nothing touches no key (tested: the constraint keeps its OID).
+- The fill triggers of reshaped tables are not involved: a move never writes the referencing tables.
+
+```mermaid
+flowchart LR
+  M{"rows of this period in DEFAULT?"} -- no --> C["create the child only"]
+  M -- yes --> D["drop the keys pointing in"] --> V["move the rows"] --> A["add the keys back, same names and definitions"]
 ```
 
 ## Maintenance locks
@@ -279,6 +417,13 @@ flowchart TD
   EXCLUSIVE` on the parent** (`LOCK TABLE ONLY` — the children are not locked one by one), held to the commit: the
   app's reads and writes of the table wait meanwhile, then run on the new child. Measured: 200,000 rows moved out of `DEFAULT` into
   a new month in 4.0 s; 365 empty daily children created in 2.6 s.
+- **The tables pointing at it are locked first.** Before the parent, every table holding a foreign key that points at
+  it is locked `ACCESS EXCLUSIVE`, one at a time in OID order (the conversion's order). Creating a child locks them
+  anyway — PostgreSQL adds the key's copy for the new child — and a move drops and re-adds their keys. Taken after the
+  parent's lock, an app transaction that wrote `orders` and then writes an order for a user (its fill trigger and key
+  check read `users`) would deadlock with the cron; this way the cron waits for it (tested; with the order reversed
+  PostgreSQL reports a deadlock). A `ROW EXCLUSIVE` lock on the parent, taken before the keys are read, keeps a new key
+  from appearing meanwhile.
 
 ```mermaid
 sequenceDiagram
@@ -317,6 +462,12 @@ or a smaller provisioning number). `errors.As` still finds the PostgreSQL error.
   `CREATE TRIGGER`, `ALTER TABLE`, a new foreign key to it — waits and then applies to the new table (tested).
 - Renaming the first index and the renames take `ACCESS EXCLUSIVE` until the commit: the table is closed to reads and
   writes from there to the commit.
+- **The tables pointing at it are locked first**: right after the checks, before any strong lock on the table itself,
+  every table holding a foreign key into it is locked `ACCESS EXCLUSIVE`, one at a time in OID order, until the
+  commit. An app transaction that wrote `orders` and then inserts an order for a user (the key check reads `users`)
+  would otherwise deadlock with the conversion — it holding `orders`, the conversion holding `users`. This way the
+  conversion waits for it (tested: the conversion waits on `orders`, the app's second insert goes through, both finish;
+  with the lock taken after the renames PostgreSQL reports a deadlock).
 - Measured: 200,000 rows into 25 monthly children 4.1 s, into 730 daily children 8.7 s.
 
 ```mermaid
@@ -534,7 +685,7 @@ Match with `errors.Is`; the message carries the names and the detail.
 
 | Error | When |
 | --- | --- |
-| `ErrInvalidTableName` | empty schema/name, over 63 bytes, a NUL byte, or `child == parent`; for `PartitionExistTable` and the maintenance calls, also a name they would create (`_new`, `_old`, `_default`, a child, an index's `_old`) over 63 bytes; an empty `schemaconf` |
+| `ErrInvalidTableName` | empty schema/name, over 63 bytes, a NUL byte, or `child == parent`; for `PartitionExistTable` and the maintenance calls, also a name they would create (`_new`, `_old`, `_default`, a child, an index's `_old`, a reshape's new column or `<constraint>_fill`) over 63 bytes; an empty `schemaconf` |
 | `ErrInvalidBound` | no strategy or two set, not the parent's strategy, wrong value count, `NULL` in a RANGE, empty LIST, bad HASH modulus/remainder, an unsupported value type |
 | `ErrParentNotPartitioned` | the parent does not exist or is not a partitioned table; for the maintenance calls, a registered table dropped or changed since its conversion |
 | `ErrPartitionConflict` | the child name is taken by anything but this exact partition; for `PartitionDropTable`, the child is not a partition of the parent |
@@ -543,10 +694,11 @@ Match with `errors.Is`; the message carries the names and the detail.
 | `ErrInvalidConfig` | `PartitionExistTable`: a nil config, an unknown `RangeType`, an empty `Key`, a date range without a named `Location`, `BlockSize` < 1 for `fixed`, or a key column that is missing, generated, or of a type the range type cannot cut; `MaintainPartitionTableProvision`: `n` < 1 |
 | `ErrAlreadyPartitioned` | `PartitionExistTable`: `partitioned_tables` lists the table, or PostgreSQL already shows it as partitioned |
 | `ErrNotPlainTable` | `PartitionExistTable`: the table does not exist, or is a view, materialized view, foreign table… |
-| `ErrReferencedByForeignKey`, `ErrUniqueKeyWithoutPartitionKey`, `ErrPrimaryKeyNotExtendable`, `ErrUnsupportedTableFeature` | `PartitionExistTable` refused the table — see *What stops a conversion* |
+| `ErrReferencedByForeignKey`, `ErrUniqueKeyWithoutPartitionKey`, `ErrPrimaryKeyNotExtendable`, `ErrUnsupportedTableFeature`, `ErrReferenceColumnTaken` | `PartitionExistTable` refused the table — see *What stops a conversion* |
 
-Anything else is a database error, wrapped: for a conversion, a row breaking a moved foreign key or a NULL key under an
-extended primary key; for any call creating children, the lock table running out (SQLSTATE 53200, with the hint
+Anything else is a database error, wrapped: for a conversion, a row breaking a moved foreign key, a NULL key under an
+extended primary key, or a referencing row whose id the table lacks (under a `NOT VALID` key — the message names the
+key and an id); for any call creating children, the lock table running out (SQLSTATE 53200, with the hint
 above); for a move, `moved N rows out of … but M back` (something — a trigger added later — swallowed rows; rolled
 back). On any error nothing of that call (or of that table, for the maintenance calls) was created, renamed, moved or
 removed.
@@ -556,8 +708,9 @@ removed.
 - **Retention** — dropping old children that hold rows. Decided not now: it is decided when a table needs it (which
   tables, how long to keep, what happens to `_old`). `PartitionDropTable` only undoes empty children the package
   created.
-- **Tables other tables point at** — a foreign key into the table stops the conversion (`ErrReferencedByForeignKey`);
-  the caller removes or reshapes it first. The other refusals under *What stops a conversion* likewise.
+- **A table's foreign key to itself** (`categories.parent_id`) — it stops the conversion (`ErrReferencedByForeignKey`).
+  The other refusals under *What stops a conversion* likewise. A move lifts only other tables' keys: a key a
+  converted table holds to itself (added by hand after the conversion) is not lifted.
 - **Attaching an existing, filled table** (`ATTACH PARTITION`) — a separate API later: it validates every row and locks
   differently.
 - **Non-blocking index building** — `ON ONLY` parent, `CONCURRENTLY` per partition, then `ATTACH` — including finishing
@@ -584,7 +737,7 @@ docker stop san_pgpartition_test
 
 `SAN_PGPARTITION_PERF=1` also runs the timing tests (`TestPerf…`: 1,200 daily children — set
 `SAN_PGPARTITION_PERF_DAYS` to change the count — 200,000 rows converted, provisioning 365 days, moving 200,000
-`DEFAULT` rows).
+`DEFAULT` rows, reshaping 200,000 referencing rows and 20,000 inserts through the fill trigger).
 
 Run from this folder: it is its own Go module (`github.com/pdcgo/san_pgpartition`), so a parent repo's `go test ./...`
 does not enter it. Test `.`, not `./...`: `examples/ensure` is a hand-run program against its own database.

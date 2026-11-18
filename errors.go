@@ -6,7 +6,10 @@ import "errors"
 // message carries the table names and the detail.
 var (
 	// ErrInvalidTableName: a schema or table name is empty, longer than
-	// PostgreSQL's 63 bytes, or contains a NUL byte.
+	// PostgreSQL's 63 bytes, or contains a NUL byte — or a name the package
+	// would create is: a conversion's <table>_new, _old, _default, children,
+	// <index>_old, and the column and <constraint>_fill trigger and function
+	// it adds to a table pointing at the converted one.
 	ErrInvalidTableName = errors.New("san_pgpartition: invalid table name")
 
 	// ErrInvalidBound: the bound does not fit the parent — no strategy or more
@@ -55,11 +58,21 @@ var (
 	ErrNotPlainTable = errors.New("san_pgpartition: not an existing plain table")
 
 	// ErrReferencedByForeignKey: Manager.PartitionExistTable refused the
-	// table because foreign keys point at it — other tables', or its own
-	// pointing back at itself. After the swap they would still reference
-	// <table>_old, and the partitioned table cannot take them on (id) alone.
-	// The error names each one; nothing was changed.
+	// table because its own foreign keys point back at it (a tree:
+	// parent_id → id). Other tables' keys pointing at it are reshaped, not
+	// refused; a key to itself cannot be, since the reshape would add a
+	// column and a trigger to the very table being converted. The error
+	// names each one; nothing was changed.
 	ErrReferencedByForeignKey = errors.New("san_pgpartition: foreign keys reference the table")
+
+	// ErrReferenceColumnTaken: Manager.PartitionExistTable refused the table
+	// because a name the reshape of a referencing table needs is taken — the
+	// column it would add (<fk column minus _id>_<Key>) already exists on that
+	// table, or two of its foreign keys would need the same one; or the fill
+	// trigger on that table or the fill function in its schema
+	// (<constraint>_fill) already exists, or two keys would need the same
+	// function. The error names each; nothing was changed.
+	ErrReferenceColumnTaken = errors.New("san_pgpartition: a name the reshape of a referencing table needs is taken")
 
 	// ErrUniqueKeyWithoutPartitionKey: Manager.PartitionExistTable refused
 	// the table because a unique constraint or unique index other than the

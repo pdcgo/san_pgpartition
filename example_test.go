@@ -50,6 +50,7 @@ func ExampleManager_PartitionExistTable() {
 	case errors.Is(err, sanpgpartition.ErrAlreadyPartitioned):
 		log.Printf("%s is already partitioned", logs)
 	case errors.Is(err, sanpgpartition.ErrReferencedByForeignKey),
+		errors.Is(err, sanpgpartition.ErrReferenceColumnTaken),
 		errors.Is(err, sanpgpartition.ErrUniqueKeyWithoutPartitionKey),
 		errors.Is(err, sanpgpartition.ErrPrimaryKeyNotExtendable),
 		errors.Is(err, sanpgpartition.ErrUnsupportedTableFeature):

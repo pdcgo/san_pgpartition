@@ -198,15 +198,6 @@ func TestManagerPartitionExistTableRefusals(t *testing.T) {
 		names []string // every offender the message must name
 	}{
 		{
-			name: "foreign keys of other tables point at it",
-			setup: logsWith(
-				"CREATE TABLE $S.orders (id bigint PRIMARY KEY, log_id bigint REFERENCES $S.logs (id))",
-				"CREATE TABLE $S.refunds (id bigint PRIMARY KEY, log_id bigint, CONSTRAINT refunds_log_fk FOREIGN KEY (log_id) REFERENCES $S.logs (id))",
-			),
-			want:  []error{ErrReferencedByForeignKey},
-			names: []string{".orders.orders_log_id_fkey", ".refunds.refunds_log_fk"},
-		},
-		{
 			name:  "its own foreign key points at itself",
 			setup: logsWith("ALTER TABLE $S.logs ADD COLUMN parent_id bigint REFERENCES $S.logs (id)"),
 			want:  []error{ErrReferencedByForeignKey},
@@ -353,13 +344,13 @@ func TestManagerPartitionExistTableRefusals(t *testing.T) {
 		{
 			name: "several at once, each named",
 			setup: logsWith(
-				"CREATE TABLE $S.orders (id bigint PRIMARY KEY, log_id bigint REFERENCES $S.logs (id))",
+				"ALTER TABLE $S.logs ADD COLUMN parent_id bigint REFERENCES $S.logs (id)",
 				"ALTER TABLE $S.logs ADD CONSTRAINT logs_note_key UNIQUE (note)",
 				"CREATE FUNCTION $S.touch() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'",
 				"CREATE TRIGGER logs_touch BEFORE INSERT ON $S.logs FOR EACH ROW EXECUTE FUNCTION $S.touch()",
 			),
 			want:  []error{ErrReferencedByForeignKey, ErrUniqueKeyWithoutPartitionKey, ErrUnsupportedTableFeature},
-			names: []string{"orders_log_id_fkey", "logs_note_key", "trigger logs_touch"},
+			names: []string{"logs_parent_id_fkey", "logs_note_key", "trigger logs_touch"},
 		},
 	}
 	for _, tc := range cases {

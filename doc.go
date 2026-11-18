@@ -3,14 +3,18 @@
 //
 // A [Manager] converts an existing plain table into one partitioned by RANGE
 // on a date or number column ([Manager.PartitionExistTable]) — same name,
-// rows, indexes and foreign keys, one transaction — and lists each converted
+// rows, indexes and foreign keys, one transaction; every other table whose
+// foreign key points at it is reshaped onto the new (id, key) primary key
+// (a new column, filled, the key re-created, a fill trigger) — and lists each converted
 // table with its [PartitionRangeConfig] in its own schema's
 // partitioned_tables. The caller's cron then keeps every listed table ready:
 // [Manager.MaintainPartitionTableProvision] creates the children n of each
 // table's own periods ahead (moving any DEFAULT rows of a period it creates
 // into the new child), and [Manager.MaintainPartition] moves the rows that
 // still land in a table's DEFAULT partition into their children and reports,
-// per table, what it moved and what it left ([MaintainReport]).
+// per table, what it moved and what it left ([MaintainReport]). A move lifts
+// the foreign keys pointing at the table around it, so no ON DELETE action
+// fires.
 //
 // Under it, plain functions work on any partitioned table: whether a child
 // partition is attached to a parent ([PartitionAttached]), creating a fresh

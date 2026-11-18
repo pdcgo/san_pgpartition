@@ -15,8 +15,8 @@ import (
 // its whole config in <schemaconf>.partitioned_tables (created on the first
 // call when missing). Everything runs in ONE transaction (a savepoint inside
 // a caller's): any error rolls all of it back, leaving the table, its indexes
-// and foreign keys exactly as they were, with no <table>_new, no
-// <table>_old and no registry row.
+// and foreign keys — and every table pointing at it — exactly as they were,
+// with no <table>_new, no <table>_old and no registry row.
 //
 // In order:
 //
@@ -30,8 +30,8 @@ import (
 //     cut (timestamptz, timestamp or date for the date types; smallint,
 //     integer or bigint for FixedRange).
 //  3. Refused, before anything is created, with every offender named:
-//     ErrReferencedByForeignKey (another table's foreign key, or its own,
-//     points at it), ErrUniqueKeyWithoutPartitionKey (a unique key other than
+//     ErrReferencedByForeignKey (its own foreign key points back at it),
+//     ErrUniqueKeyWithoutPartitionKey (a unique key other than
 //     the primary key lacks the key), ErrPrimaryKeyNotExtendable (the primary
 //     key lacks the key and is not one sequence-fed column),
 //     ErrUnsupportedTableFeature (a trigger, view, materialized view, rule,
@@ -39,29 +39,48 @@ import (
 //     exclusion constraint, granted privileges, extended statistics, an
 //     unlogged table, or another owner than the current user). The errors are
 //     joined: errors.Is matches each.
-//  4. <table>_new is created LIKE the table (defaults, CHECK and NOT NULL
+//  4. Every other table holding a foreign key that points at the table is
+//     locked ACCESS EXCLUSIVE, one at a time in OID order — before any
+//     strong lock on the table itself, so an app transaction that wrote such
+//     a table and then checks a key against this one is waited for instead
+//     of deadlocking. They stay closed until the commit. Then the names the
+//     reshape (step 13) adds are checked: the new column, and the fill
+//     trigger and function <constraint>_fill — taken, or needed twice, is
+//     ErrReferenceColumnTaken; over 63 bytes, ErrInvalidTableName.
+//  5. <table>_new is created LIKE the table (defaults, CHECK and NOT NULL
 //     constraints, generated columns, storage, comments; the table comment
 //     too), PARTITION BY RANGE (Key).
-//  5. Each index of the table is renamed <name>_old and re-created on
+//  6. Each index of the table is renamed <name>_old and re-created on
 //     <table>_new under its original name — the primary key extended to
 //     (<column>, Key) when it lacked the key.
-//  6. The table's own foreign keys are dropped from it.
-//  7. <table> is renamed <table>_old and <table>_new is renamed <table>.
+//  7. The table's own foreign keys are dropped from it.
+//  8. <table> is renamed <table>_old and <table>_new is renamed <table>.
 //     From here to the commit the app's reads and writes of the table wait;
 //     afterwards they run on the new partitioned table — nothing is lost.
-//  8. The foreign keys are added back to <table> under their names
+//  9. The foreign keys are added back to <table> under their names
 //     (validated: PostgreSQL refuses NOT VALID on a partitioned table).
-//  9. One child per day, month, year or block from the oldest to the newest
+//  10. One child per day, month, year or block from the oldest to the newest
 //     key value in <table>_old (<table>_20261117, <table>_202611,
 //     <table>_2026, <table>_0_3; a negative block <table>_m4_m1), and
 //     <table>_default for the rest (NULL and infinite keys). An empty table
 //     gets only the DEFAULT. Each carries the comment "created by
 //     san_pgpartition", so [PartitionDropTable] can undo an empty one.
-//  10. The rows are copied from <table>_old (generated columns left out).
-//  11. Each sequence a default of <table>_old draws from and that it owns is
+//  11. The rows are copied from <table>_old (generated columns left out).
+//  12. Each sequence a default of <table>_old draws from and that it owns is
 //     handed to <table>, so the caller can later DROP TABLE <table>_old.
-//  12. ANALYZE <table> (autovacuum never analyzes a partitioned parent).
-//  13. The registry row is written last.
+//  13. Every foreign key pointing at the table moves to <table> under its
+//     name. One that points at a unique key already holding Key is re-added
+//     as it was. Any other points at the primary key (<id>), which is now
+//     (<id>, Key): its table gets a column <fk column minus _id>_<Key>
+//     (user_id → user_created_at; owner → owner_created_at) of Key's type,
+//     filled from <table> by the id, NOT NULL when the foreign-key column
+//     is; a row whose id <table> lacks (possible under a NOT VALID key)
+//     fails the conversion. The key becomes (fk, new column) → (<id>, Key)
+//     ON UPDATE CASCADE, with the old key's ON DELETE and DEFERRABLE, and a
+//     BEFORE INSERT OR UPDATE OF <fk> trigger <constraint>_fill keeps the new
+//     column filled on later writes — the app keeps writing only the fk.
+//  14. ANALYZE <table> (autovacuum never analyzes a partitioned parent).
+//  15. The registry row is written last.
 //
 // <table>_old is kept, with every original row and its indexes renamed
 // <name>_old; the caller drops it once satisfied. Day, month and year start
@@ -76,6 +95,10 @@ import (
 // Running out fails with SQLSTATE 53200, which the error explains (how many
 // children, what to raise). Prefer RangeTypeMonthly unless a table is huge
 // and read by date.
+//
+// The fill trigger looks the id up across every child (≈ 0.3 ms a row on 40
+// monthly children), and a table carrying it can no longer be converted
+// itself (it has a trigger). A table's foreign key to itself stays refused.
 //
 // Afterwards the caller's cron keeps the table ready:
 // [Manager.MaintainPartitionTableProvision], then [Manager.MaintainPartition].
@@ -117,8 +140,13 @@ type conversion struct {
 	deflt   TableName // <t>_default
 	pconf   *PartitionRangeConfig
 	keyType string
-	indexes []indexInfo
-	fks     []foreignKey
+	// keyColumnType is the key column's type with its modifier, for the
+	// column a reshape adds to a referencing table.
+	keyColumnType string
+	indexes       []indexInfo
+	fks           []foreignKey
+	// incoming are the foreign keys other tables hold that point at it.
+	incoming []incomingKey
 	// children counts the children it planned, for the lock-limit hint.
 	children int
 }
@@ -184,7 +212,22 @@ func (m *Manager) convert(tx *gorm.DB, c *conversion) error {
 		return err
 	}
 
+	err = c.readIncomingKeys(tx)
+	if err != nil {
+		return err
+	}
+
 	err = c.checkRefusals(tx)
+	if err != nil {
+		return err
+	}
+
+	err = c.lockReferencing(tx)
+	if err != nil {
+		return err
+	}
+
+	err = c.planIncoming(tx)
 	if err != nil {
 		return err
 	}
@@ -238,6 +281,11 @@ func (m *Manager) convert(tx *gorm.DB, c *conversion) error {
 	}
 
 	err = c.moveSequences(tx)
+	if err != nil {
+		return err
+	}
+
+	err = c.reshapeIncoming(tx)
 	if err != nil {
 		return err
 	}
@@ -336,10 +384,12 @@ func (c *conversion) readKeyType(tx *gorm.DB) error {
 
 	var columns []struct {
 		TypeName  string
+		FullType  string
 		Generated string
 	}
 	err = tx.
 		Raw(`SELECT pg_catalog.format_type(a.atttypid, NULL) AS type_name,
+       pg_catalog.format_type(a.atttypid, a.atttypmod) AS full_type,
        a.attgenerated::text AS generated
 FROM pg_catalog.pg_attribute AS a
 WHERE a.attrelid = ?::regclass
@@ -366,6 +416,7 @@ WHERE a.attrelid = ?::regclass
 	}
 
 	c.keyType = column.TypeName
+	c.keyColumnType = column.FullType
 	return nil
 }
 

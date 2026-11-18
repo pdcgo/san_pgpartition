@@ -214,3 +214,58 @@ FROM generate_series(1, 200000) AS g`)
 	}
 	t.Logf("MaintainPartition: %v in %s", reports, time.Since(started))
 }
+
+// TestPerfReshape converts users (20,000 rows over 40 months) while orders
+// (200,000 rows) points at it, then times 20,000 app inserts into orders
+// through the fill trigger against 20,000 into a copy of orders without it.
+func TestPerfReshape(t *testing.T) {
+	skipUnlessPerf(t)
+	db := openTestDB(t)
+	ctx := context.Background()
+	schema := createTestSchema(t, db)
+	m := newTestManager(t, db)
+
+	users := TableName{Schema: schema, Name: "users"}
+	orders := TableName{Schema: schema, Name: "orders"}
+	plain := TableName{Schema: schema, Name: "orders_plain"}
+	execIn(t, db, schema,
+		"CREATE TABLE $S.users (id BIGSERIAL PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL)",
+		"INSERT INTO $S.users (created_at) SELECT timestamptz '2023-08-01 12:00+07' + (g % 40) * interval '1 month' FROM generate_series(1, 20000) AS g",
+		"CREATE TABLE $S.orders (id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES $S.users (id), note TEXT)",
+		"INSERT INTO $S.orders (user_id, note) SELECT 1 + g % 20000, 'order ' || g FROM generate_series(1, 200000) AS g",
+	)
+
+	started := time.Now()
+	err := m.PartitionExistTable(ctx, users, jakartaConfig(t, RangeTypeMonthly))
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("PartitionExistTable: %v", err)
+	}
+	t.Logf("users 20,000 rows into %d monthly children, orders 200,000 rows reshaped: %s", len(partitionNames(t, db, users))-1, elapsed)
+
+	// The same table without the trigger: its key on (user_id,
+	// user_created_at) checks the same, the app fills the column itself.
+	execIn(t, db, schema,
+		"CREATE TABLE $S.orders_plain (id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, user_created_at TIMESTAMPTZ NOT NULL, note TEXT, FOREIGN KEY (user_id, user_created_at) REFERENCES $S.users (id, created_at))",
+	)
+	var createdAts []time.Time
+	err = db.
+		Raw("SELECT created_at FROM " + users.quoted() + " ORDER BY id").
+		Scan(&createdAts).
+		Error
+	if err != nil {
+		t.Fatalf("read the users: %v", err)
+	}
+
+	started = time.Now()
+	for i := 0; i < 20000; i++ {
+		mustExec(t, db, "INSERT INTO "+orders.quoted()+" (user_id, note) VALUES (?, 'app')", 1+i)
+	}
+	t.Logf("20,000 single-row inserts with the fill trigger (the app sends user_id only): %s", time.Since(started))
+
+	started = time.Now()
+	for i := 0; i < 20000; i++ {
+		mustExec(t, db, "INSERT INTO "+plain.quoted()+" (user_id, user_created_at, note) VALUES (?, ?, 'app')", 1+i, createdAts[i])
+	}
+	t.Logf("20,000 single-row inserts without a trigger (the app sends both columns): %s", time.Since(started))
+}

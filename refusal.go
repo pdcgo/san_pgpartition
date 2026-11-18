@@ -22,8 +22,8 @@ type refusal struct {
 var refusals = []refusal{
 	{
 		sentinel: ErrReferencedByForeignKey,
-		what:     "these foreign keys reference it; after the swap they would still point at the old table — drop or reshape them first",
-		queries:  []string{refuseIncomingForeignKeys},
+		what:     "its own foreign keys point back at it, which the conversion cannot reshape — drop them first",
+		queries:  []string{refuseSelfReferences},
 	},
 	{
 		sentinel: ErrUniqueKeyWithoutPartitionKey,
@@ -87,13 +87,16 @@ func (c *conversion) checkRefusals(tx *gorm.DB) error {
 	return errors.Join(refused...)
 }
 
-const refuseIncomingForeignKeys = `
+// Other tables' foreign keys pointing at the table are reshaped
+// (incoming.go); only the table's own keys pointing back at itself stop it.
+const refuseSelfReferences = `
 SELECT n.nspname || '.' || r.relname || '.' || con.conname
 FROM pg_catalog.pg_constraint AS con
 JOIN pg_catalog.pg_class AS r ON r.oid = con.conrelid
 JOIN pg_catalog.pg_namespace AS n ON n.oid = r.relnamespace
 WHERE con.contype = 'f'
   AND con.confrelid = CAST(@oid AS bigint)::oid
+  AND con.conrelid = con.confrelid
   AND con.conparentid = 0
 ORDER BY 1`
 

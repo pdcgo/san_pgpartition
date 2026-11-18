@@ -3,7 +3,7 @@ module github.com/pdcgo/san_pgpartition
 go 1.25.0
 
 require (
-	github.com/jackc/pgx/v5 v5.10.0 // indirect
+	github.com/jackc/pgx/v5 v5.10.0
 	gorm.io/driver/postgres v1.6.0
 	gorm.io/gorm v1.31.2
 )

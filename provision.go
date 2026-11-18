@@ -34,6 +34,17 @@ import (
 // from that lock to the commit, then run on the new child. Nothing is locked
 // when nothing is missing.
 //
+// Foreign keys other tables hold that point at the table are lifted around a
+// move: dropped before the first row leaves DEFAULT and added back, same
+// names and definitions, once the table's children are done — a DELETE from
+// DEFAULT would otherwise fire them (ON DELETE CASCADE deleting the rows
+// pointing at a moved row, SET NULL unlinking them, NO ACTION failing the
+// move). Adding a key back checks every row of its table again. A call
+// that moves nothing touches no key. Whenever it creates a child, those
+// tables are locked ACCESS EXCLUSIVE first, in OID order and before the
+// parent (creating a child locks them anyway), so an app transaction
+// writing one of them is waited for rather than deadlocked with.
+//
 // Each table is one transaction, serialised with the conversion and
 // MaintainPartition through the manager's advisory lock on the table: a
 // second cron waits and then finds the children there. A failure rolls back
@@ -109,7 +120,7 @@ func (m *Manager) provisionTable(tx *gorm.DB, entry registryEntry, n int) error 
 			return lockLimitHint(err, len(missing))
 		}
 	}
-	return nil
+	return mt.restoreKeys(tx)
 }
 
 // provisionPlan lists the children the table must have after provisioning.
